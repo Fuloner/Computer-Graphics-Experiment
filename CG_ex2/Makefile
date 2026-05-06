@@ -25,6 +25,7 @@ INCLUDE	:= include
 
 # define lib directory
 LIB		:= lib
+Libraries := -lglad -lglfw3dll -lgdi32 -lopengl32 -lassimp
 
 ifeq ($(OS),Windows_NT)
 MAIN	:= main.exe
@@ -51,7 +52,17 @@ INCLUDES	:= $(patsubst %,-I%, $(INCLUDEDIRS:%/=%))
 LIBS		:= $(patsubst %,-L%, $(LIBDIRS:%/=%))
 
 # define the C source files
-SOURCES		:= $(wildcard $(patsubst %,%/*.cpp, $(SOURCEDIRS)))
+# SOURCES		:= $(wildcard $(patsubst %,%/*.cpp, $(SOURCEDIRS)))
+SOURCES := \
+    $(SRC)/main.cpp \
+    $(SRC)/stb_image.cpp \
+    $(SRC)/imgui/imgui.cpp \
+    $(SRC)/imgui/imgui_draw.cpp \
+    $(SRC)/imgui/imgui_widgets.cpp \
+    $(SRC)/imgui/imgui_tables.cpp \
+    $(SRC)/imgui/imgui_demo.cpp \
+    $(SRC)/imgui/imgui_impl_glfw.cpp \
+    $(SRC)/imgui/imgui_impl_opengl3.cpp
 
 # define the C object files
 OBJECTS		:= $(SOURCES:.cpp=.o)
@@ -74,7 +85,7 @@ $(OUTPUT):
 	$(MD) $(OUTPUT)
 
 $(MAIN): $(OBJECTS)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $(OUTPUTMAIN) $(OBJECTS) $(LFLAGS) $(LIBS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $(OUTPUTMAIN) $(OBJECTS) $(LFLAGS) $(LIBS) $(Libraries)
 
 # include all .d files
 -include $(DEPS)
