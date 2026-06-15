@@ -1,12 +1,11 @@
-/// @brief 第1步主程序 —— 基础框架搭建验证
+/// @brief 第2步主程序 —— 粒子系统基础
 /// <summary>
-/// 本程序验证以下三个模块的协作：
-/// 1. MyInit.h   —— 窗口创建与OpenGL初始化
-/// 2. MyCamera.h —— 第一人称自由摄像机（WASD移动 + 鼠标旋转 + 滚轮缩放）
-/// 3. MyShader.h —— 着色器编译、链接与uniform设置
+/// 本步骤实现：
+/// 1. Particle结构体 —— 每个流体粒子的完整状态（位置、速度、预测位置、lambda）
+/// 2. FluidSystem类  —— 管理所有粒子，初始化立方晶格排列，提供渲染数据
+/// 3. 点精灵渲染    —— 使用GL_POINTS + 圆形裁剪片元着色器，将粒子渲染为蓝色圆点
 ///
-/// 渲染内容：一个以原点为中心的线框立方体，白色线条，深色背景
-/// 按ESC退出程序
+/// 当前无物理计算，粒子静止悬浮于水箱上半部分，可用摄像机环绕观察。
 /// </summary>
 
 #include <glad/glad.h>
@@ -24,6 +23,7 @@
 #include "mygl/MyInit.h"
 #include "mygl/MyCamera.h"
 #include "mygl/MyShader.h"
+#include "mygl/FluidSystem.h"
 
 #include <iostream>
 
@@ -33,14 +33,14 @@
 const unsigned int SCR_WIDTH  = 800;
 const unsigned int SCR_HEIGHT = 600;
 
-// 摄像机对象（初始位置放在原点前方偏上的位置，便于观察立方体）
-MyCamera camera(glm::vec3(0.0f, 0.5f, 3.0f));
+// 摄像机对象（位于水箱前方，稍微抬高以便看到粒子方块的全貌）
+MyCamera camera(glm::vec3(0.0f, 0.5f, 3.5f));
 
 // 鼠标状态
-float  lastX      = SCR_WIDTH / 2.0f;  // 上一帧鼠标X坐标
-float  lastY      = SCR_HEIGHT / 2.0f;  // 上一帧鼠标Y坐标
-bool   firstMouse = true;              // 是否为首次鼠标输入
-bool   leftButtonPressed = false;      // 鼠标左键是否被按住
+float  lastX             = SCR_WIDTH / 2.0f;  // 上一帧鼠标X坐标
+float  lastY             = SCR_HEIGHT / 2.0f;  // 上一帧鼠标Y坐标
+bool   firstMouse        = true;               // 是否为首次鼠标输入
+bool   leftButtonPressed = false;              // 鼠标左键是否被按住
 
 // 时间
 float deltaTime = 0.0f;  // 上一帧耗时（秒）
@@ -63,8 +63,8 @@ int main()
     SetConsoleOutputCP(CP_UTF8);
 #endif
 
-    // ---- 1. 初始化窗口和OpenGL上下文（使用MyInit封装）----
-    MyInit myInit(SCR_WIDTH, SCR_HEIGHT, "CG FinalWork Step1 — 基础框架");
+    // ---- 1. 初始化窗口和OpenGL上下文 ----
+    MyInit myInit(SCR_WIDTH, SCR_HEIGHT, "CG FinalWork Step2 — 粒子系统基础");
 
     // 注册回调函数
     myInit.SetFramebufferSizeCallback(framebuffer_size_callback);
@@ -72,13 +72,34 @@ int main()
     myInit.SetScrollCallback(scroll_callback);
     myInit.SetMouseButtonCallback(mouse_button_callback);
 
-    // 开启深度测试，确保3D物体前后遮挡正确
+    // 开启深度测试，确保3D空间中粒子之间的前后遮挡正确
     myInit.EnableDepthTest();
 
-    // 输出OpenGL版本信息，方便调试
+    // 输出OpenGL版本信息
     std::cout << "OpenGL Version:  " << glGetString(GL_VERSION) << std::endl;
     std::cout << "GLSL Version:    " << glGetString(GL_SHADING_LANGUAGE_VERSION) << std::endl;
     std::cout << "Renderer:        " << glGetString(GL_RENDERER) << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    // ---- 2. 初始化流体粒子系统 ----
+    FluidSystem fluidSystem;
+
+    // 水箱尺寸：宽1.0 × 高2.0 × 深1.0，中心在原点（y ∈ [-1, 1]）
+    // 粒子块放置在水箱上半部分（y ∈ [0.0, 1.0]），XZ范围留出边距
+    // 每个维度10个粒子，间距0.1，共10×10×10 = 1000个粒子
+    float spacing = 0.1f;
+    glm::vec3 blockMin(-0.45f, 0.05f, -0.45f);  // 粒子块最小角（水箱上半部分的底部）
+    glm::vec3 blockMax( 0.45f, 0.95f,  0.45f);  // 粒子块最大角（水箱上半部分的顶部）
+
+    fluidSystem.initializeParticles(blockMin, blockMax, spacing);
+
+    std::cout << "粒子总数: " << fluidSystem.getParticleCount() << std::endl;
+    std::cout << "  粒子块范围: X[" << blockMin.x << ", " << blockMax.x << "]  "
+              << "Y[" << blockMin.y << ", " << blockMax.y << "]  "
+              << "Z[" << blockMin.z << ", " << blockMax.z << "]" << std::endl;
+    std::cout << "  粒子间距: " << spacing << std::endl;
+    std::cout << "  光滑核半径 h: " << fluidSystem.kernelRadius << std::endl;
+    std::cout << "  粒子渲染半径: " << fluidSystem.particleRadius << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "操作说明：" << std::endl;
     std::cout << "  WASD      — 前后左右移动摄像机" << std::endl;
@@ -86,59 +107,41 @@ int main()
     std::cout << "  鼠标左键拖拽 — 旋转视角" << std::endl;
     std::cout << "  滚轮      — 缩放（调整FOV）" << std::endl;
     std::cout << "  ESC       — 退出程序" << std::endl;
+    std::cout << "  当前为静态粒子方块，无物理模拟" << std::endl;
     std::cout << "========================================" << std::endl;
 
-    // ---- 2. 加载着色器（使用MyShader封装）----
-    MyShader shader("src/vertex_shader.glsl", "src/fragment_shader.glsl");
+    // ---- 3. 加载粒子着色器 ----
+    MyShader particleShader("src/particle_vertex.glsl", "src/particle_fragment.glsl");
 
-    // ---- 3. 构建立方体线框的顶点和索引数据 ----
-    // 立方体8个顶点的局部坐标（以原点为中心，边长为1的立方体）
-    float cubeVertices[] = {
-        // 位置坐标 (x, y, z)
-        -0.5f, -0.5f, -0.5f,  // 0: 左-下-远
-         0.5f, -0.5f, -0.5f,  // 1: 右-下-远
-         0.5f,  0.5f, -0.5f,  // 2: 右-上-远
-        -0.5f,  0.5f, -0.5f,  // 3: 左-上-远
-        -0.5f, -0.5f,  0.5f,  // 4: 左-下-近
-         0.5f, -0.5f,  0.5f,  // 5: 右-下-近
-         0.5f,  0.5f,  0.5f,  // 6: 右-上-近
-        -0.5f,  0.5f,  0.5f   // 7: 左-上-近
-    };
+    // ---- 4. 创建粒子VAO/VBO ----
+    // 获取所有粒子的位置数据（连续的float数组）
+    std::vector<float> positionData = fluidSystem.getPositionData();
 
-    // 索引数组 —— 定义12条棱，每条棱由2个端点组成（共24个索引值）
-    unsigned int cubeIndices[] = {
-        // 后面（z = -0.5）
-        0, 1,  1, 2,  2, 3,  3, 0,
-        // 前面（z = +0.5）
-        4, 5,  5, 6,  6, 7,  7, 4,
-        // 四条竖直棱（连接前后面）
-        0, 4,  1, 5,  2, 6,  3, 7
-    };
+    unsigned int particleVAO, particleVBO;
+    glGenVertexArrays(1, &particleVAO);
+    glGenBuffers(1, &particleVBO);
 
-    // 创建VAO（顶点数组对象）
-    unsigned int VAO, VBO, EBO;
-    glGenVertexArrays(1, &VAO);
-    glGenBuffers(1, &VBO);
-    glGenBuffers(1, &EBO);
+    glBindVertexArray(particleVAO);
 
-    glBindVertexArray(VAO);
+    // 将粒子位置数据上传到VBO
+    glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
+    glBufferData(GL_ARRAY_BUFFER, positionData.size() * sizeof(float),
+                 positionData.data(), GL_STATIC_DRAW);
 
-    // 上传顶点数据到VBO
-    glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(cubeVertices), cubeVertices, GL_STATIC_DRAW);
-
-    // 上传索引数据到EBO
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(cubeIndices), cubeIndices, GL_STATIC_DRAW);
-
-    // 设置顶点属性指针：位置属性（location = 0），3个float分量
+    // 设置顶点属性：位置（location = 0），3个float分量，紧密排列
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
 
-    // 解绑VAO（好的习惯，防止后续意外修改）
     glBindVertexArray(0);
 
-    // ---- 4. 渲染循环 ----
+    // 启用点精灵程序尺寸控制（允许顶点着色器中的gl_PointSize生效）
+    glEnable(GL_PROGRAM_POINT_SIZE);
+
+    // 启用混合渲染，用于粒子圆形的柔和边缘（抗锯齿效果）
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // ---- 5. 渲染循环 ----
     while (!glfwWindowShouldClose(myInit.window))
     {
         // 计算帧时间差
@@ -149,17 +152,19 @@ int main()
         // 处理键盘输入
         processKeyboard(myInit.window);
 
+        // 更新流体模拟（第2步中为占位空函数，不做物理计算）
+        fluidSystem.update(deltaTime);
+
         // 清空颜色缓冲和深度缓冲
         glClearColor(0.15f, 0.15f, 0.18f, 1.0f);  // 深色背景
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // 激活着色器
-        shader.use();
+        // ---- 渲染粒子 ----
+        particleShader.use();
 
-        // 设置变换矩阵
-        glm::mat4 model = glm::mat4(1.0f);  // 模型矩阵（单位矩阵，立方体在原位）
+        // 变换矩阵
+        glm::mat4 model = glm::mat4(1.0f);  // 粒子位置已经是世界坐标，不需要模型变换
 
-        // 投影矩阵 —— 透视投影，使用摄像机的Zoom作为FOV
         glm::mat4 projection = glm::perspective(
             glm::radians(camera.Zoom),
             (float)SCR_WIDTH / (float)SCR_HEIGHT,
@@ -167,20 +172,26 @@ int main()
             100.0f   // 远裁剪面
         );
 
-        // 视图矩阵 —— 由摄像机提供
         glm::mat4 view = camera.GetViewMatrix();
 
-        // 将矩阵传入着色器
-        shader.setMat4("model", model);
-        shader.setMat4("view", view);
-        shader.setMat4("projection", projection);
+        // 传入uniform
+        particleShader.setMat4("model", model);
+        particleShader.setMat4("view", view);
+        particleShader.setMat4("projection", projection);
 
-        // 设置线框颜色（亮白色）
-        shader.setVec3("objectColor", glm::vec3(0.9f, 0.9f, 0.9f));
+        // 点精灵缩放因子 —— 控制粒子在屏幕上的显示大小
+        // 该值 = 粒子渲染半径 * 屏幕高度 / tan(fov/2)
+        // 使得距离为1单位时，粒子点精灵的屏幕尺寸与其世界空间半径匹配
+        float pointScale = fluidSystem.particleRadius * SCR_HEIGHT
+                         / tan(glm::radians(camera.Zoom * 0.5f));
+        particleShader.setFloat("pointScale", pointScale);
 
-        // 绘制线框立方体（GL_LINES模式，每对索引构成一条线段）
-        glBindVertexArray(VAO);
-        glDrawElements(GL_LINES, 24, GL_UNSIGNED_INT, 0);
+        // 设置粒子颜色（浅蓝色，模拟水滴外观）
+        particleShader.setVec3("particleColor", glm::vec3(0.2f, 0.5f, 0.9f));
+
+        // 绘制所有粒子（使用GL_POINTS图元）
+        glBindVertexArray(particleVAO);
+        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(fluidSystem.getParticleCount()));
         glBindVertexArray(0);
 
         // 交换前后缓冲并处理事件
@@ -188,10 +199,9 @@ int main()
         glfwPollEvents();
     }
 
-    // ---- 5. 清理资源 ----
-    glDeleteVertexArrays(1, &VAO);
-    glDeleteBuffers(1, &VBO);
-    glDeleteBuffers(1, &EBO);
+    // ---- 6. 清理资源 ----
+    glDeleteVertexArrays(1, &particleVAO);
+    glDeleteBuffers(1, &particleVBO);
 
     return 0;
 }
