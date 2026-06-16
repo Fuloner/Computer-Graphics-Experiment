@@ -1,18 +1,19 @@
-/// @brief 第3步主程序 —— 邻居搜索（空间哈希）
+/// @brief 第4步主程序 —— PBF核心算法：密度约束求解
 /// <summary>
-/// 本步骤实现：
-/// 1. SpatialHashing类 —— 空间哈希网格，将3D空间划分为立方体单元，O(n)级邻居搜索
-/// 2. 集成到FluidSystem —— 每帧构建哈希表，统计每个粒子的邻居数量
-/// 3. 逐粒子颜色映射 —— 邻居多的粒子显示为白色，邻居少的显示为蓝色
-///    （内部粒子周围有约18个邻居，显示为亮白；边缘粒子邻居较少，偏蓝）
+/// 本步骤实现PBF论文中最核心的"不可压缩性"约束求解：
+/// 4a. Poly6核函数密度估算    —— ρ_i = Σ m_j · W_poly6(p_i - p_j, h)
+/// 4b. 拉格朗日乘子λ_i      —— λ_i = -C_i / (Σ||∇C_i||² + ε)
+/// 4c. 位置修正Δp_i         —— Δp_i = (1/ρ₀) Σ (λ_i+λ_j+s_corr) · ∇W_spiky
+/// 4d. 迭代求解              —— 将4a-4c重复3次
 ///
-/// 当前无物理模拟，粒子保持静止，邻居数量每帧不变。
+/// 为演示求解器效果，初始化后对粒子位置施加微小随机扰动，
+/// 求解器将通过密度约束将粒子向均匀密度方向调整。
+/// 颜色含义：浅蓝=密度接近ρ₀（约束满足），深蓝=低密度，品红=过密。
 /// </summary>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
-// Windows控制台UTF-8编码支持（解决中文乱码问题）
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -28,25 +29,27 @@
 
 #include <iostream>
 #include <vector>
+#include <cstdlib>
+#include <ctime>
 
 // ======================== 全局变量 ========================
 
-// 窗口尺寸
 const unsigned int SCR_WIDTH  = 800;
 const unsigned int SCR_HEIGHT = 600;
 
-// 摄像机对象（位于水箱前方，稍微抬高以便看到粒子方块的全貌）
 MyCamera camera(glm::vec3(0.0f, 0.5f, 3.5f));
 
-// 鼠标状态
 float  lastX             = SCR_WIDTH / 2.0f;
 float  lastY             = SCR_HEIGHT / 2.0f;
 bool   firstMouse        = true;
 bool   leftButtonPressed = false;
 
-// 时间
 float deltaTime = 0.0f;
 float lastFrame = 0.0f;
+
+// FPS计时器
+int   frameCount   = 0;
+float fpsTimer     = 0.0f;
 
 // ======================== 函数声明 ========================
 
@@ -60,115 +63,131 @@ void processKeyboard(GLFWwindow* window);
 
 int main()
 {
-    // 将Windows控制台输出编码设置为UTF-8，解决中文乱码问题
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
+    srand(static_cast<unsigned int>(time(nullptr)));
 
     // ---- 1. 初始化窗口和OpenGL上下文 ----
-    MyInit myInit(SCR_WIDTH, SCR_HEIGHT, "CG FinalWork Step3 — 邻居搜索（空间哈希）");
+    MyInit myInit(SCR_WIDTH, SCR_HEIGHT, "CG FinalWork Step4 — PBF密度约束求解");
 
     myInit.SetFramebufferSizeCallback(framebuffer_size_callback);
     myInit.SetCursorPosCallback(mouse_callback);
     myInit.SetScrollCallback(scroll_callback);
     myInit.SetMouseButtonCallback(mouse_button_callback);
-
     myInit.EnableDepthTest();
 
     std::cout << "OpenGL Version:  " << glGetString(GL_VERSION) << std::endl;
     std::cout << "GLSL Version:    " << glGetString(GL_SHADING_LANGUAGE_VERSION) << std::endl;
     std::cout << "========================================" << std::endl;
 
-    // ---- 2. 初始化流体粒子系统 ----
+    // ---- 2. 初始化粒子系统 ----
     FluidSystem fluidSystem;
 
-    // 水箱尺寸：宽1.0 × 高2.0 × 深1.0，中心在原点（y ∈ [-1, 1]）
-    // 粒子块放置在水箱上半部分（y ∈ [0.0, 1.0]），间距0.1，10×10×10 = 1000个粒子
     float spacing = 0.1f;
     glm::vec3 blockMin(-0.45f, 0.05f, -0.45f);
     glm::vec3 blockMax( 0.45f, 0.95f,  0.45f);
-
     fluidSystem.initializeParticles(blockMin, blockMax, spacing);
 
     std::cout << "粒子总数:        " << fluidSystem.getParticleCount() << std::endl;
-    std::cout << "  粒子块范围: X[" << blockMin.x << ", " << blockMax.x << "]  "
-              << "Y[" << blockMin.y << ", " << blockMax.y << "]  "
-              << "Z[" << blockMin.z << ", " << blockMax.z << "]" << std::endl;
-    std::cout << "  粒子间距:       " << spacing << std::endl;
-    std::cout << "  光滑核半径 h:   " << fluidSystem.kernelRadius << std::endl;
-    std::cout << "  粒子渲染半径:   " << fluidSystem.particleRadius << std::endl;
-    std::cout << "  静止密度 ρ₀:    " << fluidSystem.restDensity << std::endl;
+    std::cout << "  光滑核半径h:   " << fluidSystem.kernelRadius << std::endl;
+    std::cout << "  静止密度ρ₀:    " << fluidSystem.restDensity << std::endl;
+    std::cout << "  求解迭代次数:  " << fluidSystem.solverIterations << std::endl;
     std::cout << "========================================" << std::endl;
+
+    // ---- 施加初始扰动（破坏完美晶格，演示求解器效果）----
+    // 扰动幅度0.02世界单位，约为粒子间距的20%
+    fluidSystem.perturbInitialPositions(0.02f);
+
+    // ---- 执行首次求解并输出密度统计 ----
+    fluidSystem.update(0.0f);
+    fluidSystem.printDensityStats();
+    std::cout << std::endl;
+
     std::cout << "操作说明：" << std::endl;
     std::cout << "  WASD      — 前后左右移动摄像机" << std::endl;
     std::cout << "  Q/E       — 升降摄像机" << std::endl;
     std::cout << "  鼠标左键拖拽 — 旋转视角" << std::endl;
     std::cout << "  滚轮      — 缩放（调整FOV）" << std::endl;
     std::cout << "  ESC       — 退出程序" << std::endl;
-    std::cout << "  颜色含义：白色=邻居多（内部粒子），深蓝=邻居少（边缘/角落）" << std::endl;
+    std::cout << "  颜色：浅蓝=密度正常，深蓝=低密度，品红=过密度" << std::endl;
+    std::cout << "  扰动后粒子方块边缘可能略微扩散或收缩" << std::endl;
     std::cout << "========================================" << std::endl;
-
-    // ---- 执行首次邻居搜索（输出统计信息到控制台）----
-    fluidSystem.updateNeighborSearch(true);
 
     // ---- 3. 加载粒子着色器 ----
     MyShader particleShader("src/particle_vertex.glsl", "src/particle_fragment.glsl");
 
-    // ---- 4. 创建粒子VAO和VBO（位置 + 颜色）----
+    // ---- 4. 创建VAO和VBO（位置 + 颜色，均为DYNAMIC_DRAW，每帧更新）----
     std::vector<float> positionData = fluidSystem.getPositionData();
     std::vector<glm::vec3> colorData = fluidSystem.getColorData();
 
     unsigned int particleVAO;
-    unsigned int particleVBOs[2];  // VBO[0]=位置, VBO[1]=颜色
+    unsigned int particleVBOs[2];
     glGenVertexArrays(1, &particleVAO);
     glGenBuffers(2, particleVBOs);
 
     glBindVertexArray(particleVAO);
 
-    // VBO[0]：粒子位置数据（location = 0）
+    // VBO[0]：粒子位置（每帧更新，因为求解器持续修改位置）
     glBindBuffer(GL_ARRAY_BUFFER, particleVBOs[0]);
     glBufferData(GL_ARRAY_BUFFER, positionData.size() * sizeof(float),
-                 positionData.data(), GL_STATIC_DRAW);
+                 positionData.data(), GL_DYNAMIC_DRAW);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
 
-    // VBO[1]：逐粒子颜色数据（location = 1），由邻居数量决定
+    // VBO[1]：逐粒子颜色（每帧更新，反映密度变化）
     glBindBuffer(GL_ARRAY_BUFFER, particleVBOs[1]);
     glBufferData(GL_ARRAY_BUFFER, colorData.size() * sizeof(glm::vec3),
-                 colorData.data(), GL_DYNAMIC_DRAW);  // DYNAMIC_DRAW：后续帧中会更新
+                 colorData.data(), GL_DYNAMIC_DRAW);
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
     glEnableVertexAttribArray(1);
 
     glBindVertexArray(0);
 
-    // 启用点精灵程序尺寸控制（允许顶点着色器中的gl_PointSize生效）
     glEnable(GL_PROGRAM_POINT_SIZE);
-
-    // 启用混合渲染，用于粒子圆形的柔和边缘
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     // ---- 5. 渲染循环 ----
     while (!glfwWindowShouldClose(myInit.window))
     {
-        // 计算帧时间差
         float currentFrame = static_cast<float>(glfwGetTime());
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
 
-        // 处理键盘输入
+        // FPS统计
+        frameCount++;
+        fpsTimer += deltaTime;
+        if (fpsTimer >= 1.0f)
+        {
+            float fps = frameCount / fpsTimer;
+            // 在窗口标题栏显示FPS
+            std::string title = "CG FinalWork Step4 — PBF密度约束求解  [FPS: "
+                              + std::to_string(static_cast<int>(fps))
+                              + " | 粒子: " + std::to_string(fluidSystem.getParticleCount()) + "]";
+            glfwSetWindowTitle(myInit.window, title.c_str());
+            frameCount = 0;
+            fpsTimer = 0.0f;
+        }
+
         processKeyboard(myInit.window);
 
-        // 更新流体模拟（当前执行邻居搜索，粒子不动但为后续步骤做准备）
+        // 执行PBF密度约束求解
         fluidSystem.update(deltaTime);
 
-        // 更新颜色VBO（因为后续步骤中粒子会移动，邻居关系会变化）
+        // 更新位置VBO（粒子位置在求解中被修改）
+        positionData = fluidSystem.getPositionData();
+        glBindBuffer(GL_ARRAY_BUFFER, particleVBOs[0]);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, positionData.size() * sizeof(float),
+                        positionData.data());
+
+        // 更新颜色VBO（颜色反映当前密度分布）
         colorData = fluidSystem.getColorData();
         glBindBuffer(GL_ARRAY_BUFFER, particleVBOs[1]);
         glBufferSubData(GL_ARRAY_BUFFER, 0, colorData.size() * sizeof(glm::vec3),
                         colorData.data());
 
-        // 清空颜色缓冲和深度缓冲
+        // 清空缓冲
         glClearColor(0.15f, 0.15f, 0.18f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -176,12 +195,10 @@ int main()
         particleShader.use();
 
         glm::mat4 model = glm::mat4(1.0f);
-
         glm::mat4 projection = glm::perspective(
             glm::radians(camera.Zoom),
             (float)SCR_WIDTH / (float)SCR_HEIGHT,
             0.1f, 100.0f);
-
         glm::mat4 view = camera.GetViewMatrix();
 
         particleShader.setMat4("model", model);
@@ -200,7 +217,7 @@ int main()
         glfwPollEvents();
     }
 
-    // ---- 6. 清理资源 ----
+    // ---- 6. 清理 ----
     glDeleteVertexArrays(1, &particleVAO);
     glDeleteBuffers(2, particleVBOs);
 
@@ -232,9 +249,7 @@ void mouse_callback(GLFWwindow* /*window*/, double xposIn, double yposIn)
     lastY = ypos;
 
     if (leftButtonPressed)
-    {
         camera.ProcessMouseMovement(xoffset, yoffset);
-    }
 }
 
 void scroll_callback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset)

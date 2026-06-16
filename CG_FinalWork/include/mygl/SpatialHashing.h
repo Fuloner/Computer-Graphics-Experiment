@@ -67,26 +67,42 @@ public:
     }
 
     /// <summary>
+    /// 基于预测位置（predictedPosition）构建空间哈希网格
+    /// PBF密度约束求解中，粒子预测位置会不断变化，需要每轮迭代重建哈希表
+    /// </summary>
+    void buildForPredicted(const std::vector<Particle>& particles, float radius)
+    {
+        cellSize = radius;
+        table.clear();
+
+        for (size_t i = 0; i < particles.size(); ++i)
+        {
+            unsigned int h = hashPosition(particles[i].predictedPosition);
+            table[h].push_back(static_cast<int>(i));
+        }
+    }
+
+    /// <summary>
     /// 查找给定位置周围所有距离小于cellSize(=h)的粒子索引（即邻居列表）
     /// 查询范围为该位置所在网格及其3×3×3=27邻域内的所有粒子
     /// </summary>
     /// <param name="pos">查询位置（通常是某个粒子的位置）</param>
     /// <param name="particles">所有粒子的数组（用于计算精确距离）</param>
     /// <param name="radius">光滑核半径h，只有距离< h的粒子才被返回</param>
-    /// <returns>邻居粒子的索引列表</returns>
+    /// <param name="usePredicted">若为true，使用particles[idx].predictedPosition计算距离；
+    /// 否则使用particles[idx].position。PBF密度约束求解时需设为true</param>
     std::vector<int> findNeighbors(const glm::vec3& pos,
                                    const std::vector<Particle>& particles,
-                                   float radius) const
+                                   float radius, bool usePredicted = false) const
     {
         std::vector<int> neighbors;
-        float radiusSq = radius * radius;  // 使用平方距离比较，避免开方
+        float radiusSq = radius * radius;
 
-        // 计算查询位置所在的网格单元坐标
         int cx = static_cast<int>(std::floor(pos.x / cellSize));
         int cy = static_cast<int>(std::floor(pos.y / cellSize));
         int cz = static_cast<int>(std::floor(pos.z / cellSize));
 
-        // 遍历周围3×3×3=27个相邻网格单元（包括自身所在的单元）
+        // 遍历周围3×3×3=27个相邻网格单元
         for (int dx = -1; dx <= 1; ++dx)
         {
             for (int dy = -1; dy <= 1; ++dy)
@@ -96,20 +112,19 @@ public:
                     unsigned int h = hashCell(cx + dx, cy + dy, cz + dz);
                     auto it = table.find(h);
                     if (it == table.end())
-                        continue;  // 该单元为空，跳过
+                        continue;
 
-                    // 遍历该单元内的所有候选粒子
                     for (int idx : it->second)
                     {
-                        // 计算精确的平方距离
-                        glm::vec3 diff = pos - particles[idx].position;
+                        // 根据uPsePredicted标志选择使用实际位置还是预测位置
+                        const glm::vec3& p = usePredicted
+                            ? particles[idx].predictedPosition
+                            : particles[idx].position;
+                        glm::vec3 diff = pos - p;
                         float distSq = diff.x * diff.x + diff.y * diff.y + diff.z * diff.z;
 
-                        // 筛选距离在光滑核半径内的粒子（包括自身，因为距离=0 < h）
                         if (distSq < radiusSq)
-                        {
                             neighbors.push_back(idx);
-                        }
                     }
                 }
             }
