@@ -87,9 +87,11 @@ int main()
     // 水箱尺寸：宽1.0 × 高2.0 × 深1.0，中心在原点（y ∈ [-1, 1]）
     // 粒子块放置在水箱上半部分（y ∈ [0.0, 1.0]），XZ范围留出边距
     // 每个维度10个粒子，间距0.1，共10×10×10 = 1000个粒子
-    float spacing = 0.1f;
+    float spacing = 0.08f;
     glm::vec3 blockMin(-0.45f, 0.05f, -0.45f);  // 粒子块最小角（水箱上半部分的底部）
     glm::vec3 blockMax( 0.45f, 0.95f,  0.45f);  // 粒子块最大角（水箱上半部分的顶部）
+    //glm::vec3 blockMin(-0.3f, 0.3f, -0.3f);
+    //glm::vec3 blockMax( 0.3f, 0.9f,  0.3f);
 
     fluidSystem.initializeParticles(blockMin, blockMax, spacing);
 

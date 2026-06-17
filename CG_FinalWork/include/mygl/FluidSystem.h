@@ -11,6 +11,7 @@
 #include <algorithm>
 
 #include "Particle.h"
+#include "SpatialHashing.h"
 
 /// <summary>
 /// 流体系统类 —— 管理所有流体粒子，负责初始化、更新和提供渲染所需数据
@@ -98,18 +99,26 @@ public:
         // 重置密度
         for (auto& p : particles) p.density = 0.0f;
 
-        // 暴力遍历所有粒子对（包括自身）
+        // 构建空间哈希
+        SpatialHashing hashGrid;
+        hashGrid.build(particles, h);
+
+        // 对每个粒子，获取邻居并累加密度
         for (size_t i = 0; i < particles.size(); ++i)
         {
-            for (size_t j = 0; j < particles.size(); ++j)
+            auto neighbors = hashGrid.findNeighbors(particles[i].position, particles, h, false);
+            float rho = 0.0f;
+            for (int j : neighbors)
             {
-                glm::vec3 r = particles[i].position - particles[j].position;
+                const auto& pj = particles[j];
+                glm::vec3 r = particles[i].position - pj.position;
                 float r2 = r.x*r.x + r.y*r.y + r.z*r.z;
+                // findNeighbors 已保证 r2 < h2，但为了安全仍检查
                 if (r2 >= h2) continue;
                 float diff = h2 - r2;
-                float w = poly6Coeff * diff * diff * diff;
-                particles[i].density += particles[j].mass * w;
+                rho += pj.mass * poly6Coeff * diff * diff * diff;
             }
+            particles[i].density = rho;
         }
     }
 
