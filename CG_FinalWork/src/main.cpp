@@ -5,7 +5,7 @@
 /// 2. FluidSystem类  —— 管理所有粒子，初始化立方晶格排列，提供渲染数据
 /// 3. 点精灵渲染    —— 使用GL_POINTS + 圆形裁剪片元着色器，将粒子渲染为蓝色圆点
 ///
-/// 当前无物理计算，粒子静止悬浮于水箱上半部分，可用摄像机环绕观察。
+/// 
 /// </summary>
 
 #include <glad/glad.h>
@@ -33,8 +33,8 @@
 const unsigned int SCR_WIDTH  = 800;
 const unsigned int SCR_HEIGHT = 600;
 
-// 摄像机对象（位于水箱前方，稍微抬高以便看到粒子方块的全貌）
-MyCamera camera(glm::vec3(0.0f, 0.5f, 3.5f));
+// 摄像机对象
+MyCamera camera(glm::vec3(0.0f, 0.5f, 3.5f), glm::vec3(0.0f, 1.0f, 0.0f), -90.0f, -15.0f);
 
 // 鼠标状态
 float  lastX             = SCR_WIDTH / 2.0f;  // 上一帧鼠标X坐标
@@ -63,7 +63,7 @@ int main()
     SetConsoleOutputCP(CP_UTF8);
 #endif
 
-    // ---- 1. 初始化窗口和OpenGL上下文 ----
+    // ---- 一、初始化窗口和OpenGL上下文 ----
     MyInit myInit(SCR_WIDTH, SCR_HEIGHT, "CG FinalWork Step2 — 粒子系统基础");
 
     // 注册回调函数
@@ -116,6 +116,7 @@ int main()
     // ---- 4. 创建粒子VAO/VBO ----
     // 获取所有粒子的位置数据（连续的float数组）
     std::vector<float> positionData = fluidSystem.getPositionData();
+    std::vector<glm::vec3> colorData = fluidSystem.getColorData();
 
     unsigned int particleVAO, particleVBO;
     glGenVertexArrays(1, &particleVAO);
@@ -125,12 +126,20 @@ int main()
 
     // 将粒子位置数据上传到VBO
     glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
-    glBufferData(GL_ARRAY_BUFFER, positionData.size() * sizeof(float),
-                 positionData.data(), GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, positionData.size() * sizeof(float), positionData.data(), GL_STATIC_DRAW);
 
     // 设置顶点属性：位置（location = 0），3个float分量，紧密排列
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
+
+    unsigned int particleVBO_color;
+    glGenBuffers(1, &particleVBO_color);
+
+    glBindBuffer(GL_ARRAY_BUFFER, particleVBO_color);
+    glBufferData(GL_ARRAY_BUFFER, colorData.size() * sizeof(glm::vec3), colorData.data(), GL_DYNAMIC_DRAW);
+    
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
+    glEnableVertexAttribArray(1);
 
     glBindVertexArray(0);
 
@@ -152,8 +161,21 @@ int main()
         // 处理键盘输入
         processKeyboard(myInit.window);
 
-        // 更新流体模拟（第2步中为占位空函数，不做物理计算）
+        // 更新流体模拟
+        deltaTime /= 3.0f;
         fluidSystem.update(deltaTime);
+
+        // 更新粒子位置数据到VBO
+        std::vector<float> newPosData = fluidSystem.getPositionData();
+        glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, newPosData.size() * sizeof(float), newPosData.data());
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+        // 
+        std::vector<glm::vec3> newColorData = fluidSystem.getColorData();
+        glBindBuffer(GL_ARRAY_BUFFER, particleVBO_color);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, newColorData.size() * sizeof(glm::vec3), newColorData.data());
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
 
         // 清空颜色缓冲和深度缓冲
         glClearColor(0.15f, 0.15f, 0.18f, 1.0f);  // 深色背景
@@ -179,14 +201,9 @@ int main()
         particleShader.setMat4("view", view);
         particleShader.setMat4("projection", projection);
 
-        // 点精灵缩放因子 —— 控制粒子在屏幕上的显示大小
-        // 该值 = 粒子渲染半径 * 屏幕高度 / tan(fov/2)
-        // 使得距离为1单位时，粒子点精灵的屏幕尺寸与其世界空间半径匹配
-        float pointScale = fluidSystem.particleRadius * SCR_HEIGHT
-                         / tan(glm::radians(camera.Zoom * 0.5f));
-        particleShader.setFloat("pointScale", pointScale);
+        particleShader.setFloat("pointScale", 5.0f);
 
-        // 设置粒子颜色（浅蓝色，模拟水滴外观）
+        // 设置粒子颜色（浅蓝色，模拟水滴外观） 暂时不需要
         particleShader.setVec3("particleColor", glm::vec3(0.2f, 0.5f, 0.9f));
 
         // 绘制所有粒子（使用GL_POINTS图元）

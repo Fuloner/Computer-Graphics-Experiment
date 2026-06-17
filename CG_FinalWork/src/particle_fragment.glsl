@@ -2,6 +2,8 @@
 // 粒子片段着色器 —— 将方形点精灵裁剪为边缘柔和的圆形，模拟球形粒子外观
 // gl_PointCoord 是点精灵内部的标准化的纹理坐标，范围[0, 1]，原点在左下角
 
+in vec3 vColor;
+
 out vec4 FragColor;              // 输出片段颜色
 
 uniform vec3 particleColor;      // 粒子颜色（浅蓝色系，模拟水滴外观）
@@ -22,5 +24,5 @@ void main()
     // 在圆形内部添加微妙的立体感：中心稍亮、边缘稍暗
     float brightness = 1.0 - dist * 0.3;
 
-    FragColor = vec4(particleColor * brightness, alpha);
+    FragColor = vec4(vColor * brightness, alpha);
 }

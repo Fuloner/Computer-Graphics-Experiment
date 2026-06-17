@@ -10,26 +10,7 @@
 #include <vector>
 #include <algorithm>
 
-/// <summary>
-/// 单个流体粒子的数据结构
-/// 对应PBF论文中的粒子状态：位置、速度、预测位置、拉格朗日乘子
-/// </summary>
-struct Particle
-{
-    glm::vec3 position;           // 粒子的当前位置 p_i
-    glm::vec3 velocity;           // 粒子的速度 v_i
-    glm::vec3 predictedPosition;  // 预测位置 p_i*（PBF迭代的中间变量，初始等于position）
-    float     lambda = 0.0f;      // 拉格朗日乘子 λ_i（密度约束的强度系数）
-    float     mass = 1.0f;        // 粒子质量（所有粒子质量相同）
-
-    Particle() = default;
-
-    /// <summary>
-    /// 用指定位置构造粒子，速度初始为零，预测位置等于当前位置
-    /// </summary>
-    Particle(const glm::vec3& pos, float m = 1.0f)
-        : position(pos), velocity(0.0f), predictedPosition(pos), mass(m) {}
-};
+#include "Particle.h"
 
 /// <summary>
 /// 流体系统类 —— 管理所有流体粒子，负责初始化、更新和提供渲染所需数据
@@ -40,8 +21,13 @@ public:
     std::vector<Particle> particles;  // 所有粒子的数组
 
     float particleRadius = 0.05f;     // 粒子渲染半径（约等于光滑核半径的一半）
-    float kernelRadius   = 0.1f;      // 光滑核半径 h（PBF算法中用于计算密度和邻居搜索的范围）
+    float kernelRadius   = 1.2f;      // 光滑核半径 h（PBF算法中用于计算密度和邻居搜索的范围）
     float restDensity    = 1000.0f;   // 静止密度 ρ₀（水的参考密度，单位：kg/m³，用于约束求解）
+
+    //水箱边界常量
+    glm::vec3 tankMin = glm::vec3(-0.5f, -1.0f, -0.5f);
+    glm::vec3 tankMax = glm::vec3( 0.5f,  1.0f,  0.5f);
+    float restitution = 0.3f;  // 反弹系数
 
     FluidSystem() = default;
 
@@ -101,6 +87,55 @@ public:
     }
 
     /// <summary>
+    /// 计算密度
+    /// </summary>
+    void computeDensity()
+    {
+        float h = kernelRadius;
+        float h2 = h * h;
+        float poly6Coeff = 315.0f / (64.0f * 3.141592653589793f * pow(h, 9));
+
+        // 重置密度
+        for (auto& p : particles) p.density = 0.0f;
+
+        // 暴力遍历所有粒子对（包括自身）
+        for (size_t i = 0; i < particles.size(); ++i)
+        {
+            for (size_t j = 0; j < particles.size(); ++j)
+            {
+                glm::vec3 r = particles[i].position - particles[j].position;
+                float r2 = r.x*r.x + r.y*r.y + r.z*r.z;
+                if (r2 >= h2) continue;
+                float diff = h2 - r2;
+                float w = poly6Coeff * diff * diff * diff;
+                particles[i].density += particles[j].mass * w;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 获取颜色
+    /// </summary>
+    std::vector<glm::vec3> getColorData() const
+    {
+        float maxDensity = 0.0f, minDensity = FLT_MAX;
+        for (const auto& p : particles) {
+            if (p.density > maxDensity) maxDensity = p.density;
+            if (p.density < minDensity) minDensity = p.density;
+        }
+        if (maxDensity < 1e-6f) maxDensity = 1.0f;
+
+        std::vector<glm::vec3> colors;
+        colors.reserve(particles.size());
+        for (const auto& p : particles) {
+            float normalized = (p.density - minDensity) / (maxDensity - minDensity + 1e-6f);
+            // 低密度→蓝色，高密度→红色
+            colors.push_back(glm::mix(glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(1.0f, 0.0f, 0.0f), normalized));
+        }
+        return colors;
+    }
+
+    /// <summary>
     /// 返回粒子总数
     /// </summary>
     size_t getParticleCount() const
@@ -109,13 +144,31 @@ public:
     }
 
     /// <summary>
-    /// 更新流体模拟（第2步暂不实现物理计算，仅作为占位）
+    /// 更新流体模拟
     /// </summary>
     /// <param name="deltaTime">上一帧耗时（秒）</param>
-    void update(float /*deltaTime*/)
+    void update(float deltaTime)
     {
-        // 第2步：不做任何物理计算，粒子保持在初始位置不动
-        // 后续步骤将在此实现PBF算法的主循环
+        computeDensity();
+
+        // 在此实现PBF算法的主循环
+        const glm::vec3 gravity = glm::vec3(0.0f, -9.8f, 0.0f);
+
+        for(auto& p : particles)
+        {
+            //施加重力
+            p.velocity += gravity * deltaTime;
+            //更新位置
+            p.position += p.velocity * deltaTime;
+
+            //边界碰撞
+            if (p.position.x < tankMin.x) { p.position.x = tankMin.x; p.velocity.x = -p.velocity.x * restitution; }
+            if (p.position.x > tankMax.x) { p.position.x = tankMax.x; p.velocity.x = -p.velocity.x * restitution; }
+            if (p.position.y < tankMin.y) { p.position.y = tankMin.y; p.velocity.y = -p.velocity.y * restitution; }
+            if (p.position.y > tankMax.y) { p.position.y = tankMax.y; p.velocity.y = -p.velocity.y * restitution; }
+            if (p.position.z < tankMin.z) { p.position.z = tankMin.z; p.velocity.z = -p.velocity.z * restitution; }
+            if (p.position.z > tankMax.z) { p.position.z = tankMax.z; p.velocity.z = -p.velocity.z * restitution; }
+        }
     }
 };
 
