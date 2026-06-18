@@ -117,7 +117,8 @@ int main()
     std::cout << "========================================" << std::endl;
 
     // ---- 3. 加载粒子着色器 ----
-    MyShader particleShader("src/particle_vertex.glsl", "src/particle_fragment.glsl");
+    //MyShader particleShader("src/particle_vertex.glsl", "src/particle_fragment.glsl");
+    MyShader particleShader("src/fluid_vertex.glsl", "src/fluid_fragment.glsl");
 
     // ---- 4. 创建粒子VAO/VBO ----
     // 获取所有粒子的位置数据（连续的float数组）
@@ -199,6 +200,15 @@ int main()
 
         // ---- 渲染粒子 ----
         particleShader.use();
+
+        #pragma region 方案一：增强型点精灵渲染
+        // 设置光源方向（固定为从右上方向下）
+        glm::vec3 lightDir = glm::normalize(glm::vec3(1.0f, 2.0f, 1.0f));
+        particleShader.setVec3("lightDir", lightDir);
+
+        // 设置摄像机位置（用于菲涅尔）
+        particleShader.setVec3("viewPos", camera.Position);
+        #pragma endregion
 
         // 变换矩阵
         glm::mat4 model = glm::mat4(1.0f);  // 粒子位置已经是世界坐标，不需要模型变换
