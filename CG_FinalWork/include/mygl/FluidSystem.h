@@ -20,10 +20,10 @@
 class FluidSystem
 {
 public:
-    std::vector<Particle> particles;  // 所有粒子的数组
+    std::vector<Particle> particles;  //所有粒子的数组
 
-    float particleRadius = 0.05f;     // 粒子渲染半径（约等于光滑核半径的一半）
-    float restDensity    = 1000.0f;   // 静止密度 ρ₀（水的参考密度，单位：kg/m³，用于约束求解）
+    float particleRadius = 0.05f;     //粒子渲染半径（约等于光滑核半径的一半）暂时未使用
+    float restDensity    = 1000.0f;   //静止密度 ρ₀（水的参考密度，单位：kg/m³，用于约束求解）
 
     //水箱边界常量
     glm::vec3 tankMin = glm::vec3(-0.5f, -1.0f, -0.5f);
@@ -32,12 +32,29 @@ public:
     // glm::vec3 tankMax = glm::vec3( 1.0f,  1.0f,  1.0f);
     float restitution = 0.3f;  // 反弹系数
 
-    // ---- PBF 参数 ----
-    int   solverIterations = 3;
-    float epsilon = 10.0f;      // CFM 正则化参数 一般设为0.02~0.05 约束防止爆炸
-    float h = 0.15f;             // 光滑核半径 h（PBF算法中用于计算密度和邻居搜索的范围） 略大于spacing 保证有5+个邻居
+    //PBF 参数
+    int   solverIterations = 3; //3~5次 迭代计算即可
+    float epsilon = 10.0f; //CFM 正则化参数 一般设为 0.02~0.05 约束防止爆炸
+    float h = 0.15f; //光滑核半径 h（PBF算法中用于计算密度和邻居搜索的范围） 略大于spacing 保证有5+个邻居
+
+    //人工压力项参数
+    float sCorrK = 0.1f;         // 强度系数
+    float sCorrN = 4.0f;         // 幂次
+    float sCorrDeltaQ = 0.3f;    // 相对于 h 的偏移比例
 
     FluidSystem() = default;
+
+    /// <summary>
+    /// 辅助函数：Poly6 核函数（用于 W(r) 计算）
+    /// </summary>
+    float W_poly6(float r2, float h)
+    {
+        float h2 = h * h;
+        if (r2 >= h2 || r2 < 0.0f) return 0.0f;
+        float diff = h2 - r2;
+        float coeff = 315.0f / (64.0f * 3.141592653589793f * pow(h, 9));
+        return coeff * diff * diff * diff;
+    }
 
     /// <summary>
     /// 在指定的轴对齐包围盒（AABB）内以立方晶格排列初始化粒子
@@ -252,11 +269,22 @@ public:
                 // Spiky 梯度
                 float hMinusR = h - rLen;
                 glm::vec3 gW = spikyCoeff * (hMinusR * hMinusR / rLen) * r;
+
+                //增加 scorr 项
+                /*
+                float r2 = rLen * rLen;
+                float wVal = W_poly6(r2, h); //当前粒子的 Poly6 核值
+                float wRef = W_poly6((sCorrDeltaQ * h) * (sCorrDeltaQ * h), h); // 参考值
+                float ratio = wVal / (wRef + 1e-10f);
+                float sCorr = -sCorrK * pow(ratio, sCorrN);
+                */
+
+                //deltaP[i] += (lambda_i + particles[idx].lambda + sCorr) * gW;
                 deltaP[i] += (lambda_i + particles[idx].lambda) * gW;
             }
             deltaP[i] /= rho0;
             
-            float maxCorrection = 0.002f; // 约束 防止爆炸
+            float maxCorrection = 0.002f; // 约束 防止爆炸 无sCorr设为0.002
             float len = glm::length(deltaP[i]);
             if (len > maxCorrection)
                 deltaP[i] = deltaP[i] / len * maxCorrection;
@@ -286,6 +314,33 @@ public:
             if (p.predictedPosition.z < tankMin.z) p.predictedPosition.z = tankMin.z;
             if (p.predictedPosition.z > tankMax.z) p.predictedPosition.z = tankMax.z;
         }
+    }
+
+    /// <summary>
+    /// 应用 XSPH 粘性，平滑速度场，使流体运动更连贯。
+    /// </summary>
+    /// <param name="xsphCoeff">粘性系数，通常取 0.01~0.03</param>
+    void applyXSPH(float xsphCoeff)
+    {
+        SpatialHashing hashGrid;
+        hashGrid.build(particles, h); //基于当前位置构建哈希
+
+        std::vector<glm::vec3> newVelocities(particles.size());
+        for (size_t i = 0; i < particles.size(); ++i)
+        {
+            newVelocities[i] = particles[i].velocity;
+            auto neighbors = hashGrid.findNeighbors(particles[i].position, particles, h, false);
+            for (int idx : neighbors)
+            {
+                if (idx == (int)i) continue;
+                float r = glm::length(particles[i].position - particles[idx].position);
+                float r2 = r * r;
+                float w = W_poly6(r2, h);
+                newVelocities[i] += xsphCoeff * (particles[idx].velocity - particles[i].velocity) * w;
+            }
+        }
+        for (size_t i = 0; i < particles.size(); ++i)
+            particles[i].velocity = newVelocities[i];
     }
 
     /// <summary>
@@ -353,6 +408,9 @@ public:
         {
             particles[i].velocity = (particles[i].predictedPosition - originalPositions[i]) / deltaTime;
         }
+
+        //施加XSPH
+        //applyXSPH(0.0001f);
 
         //更新位置
         for (auto& p : particles)
