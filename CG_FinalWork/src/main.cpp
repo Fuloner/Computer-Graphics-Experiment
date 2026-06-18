@@ -34,7 +34,7 @@ const unsigned int SCR_WIDTH  = 800;
 const unsigned int SCR_HEIGHT = 600;
 
 // 摄像机对象
-MyCamera camera(glm::vec3(0.0f, 0.5f, 3.5f), glm::vec3(0.0f, 1.0f, 0.0f), -90.0f, -15.0f);
+MyCamera camera(glm::vec3(0.0f, 1.0f, 5.0f), glm::vec3(0.0f, 1.0f, 0.0f), -90.0f, -12.0f);
 
 // 鼠标状态
 float  lastX             = SCR_WIDTH / 2.0f;  // 上一帧鼠标X坐标
@@ -45,6 +45,10 @@ bool   leftButtonPressed = false;              // 鼠标左键是否被按住
 // 时间
 float deltaTime = 0.0f;  // 上一帧耗时（秒）
 float lastFrame = 0.0f;  // 上一帧的时间点
+float fixedDt = 0.004f;  // 每个子步时间
+int subSteps = 5;        // 每帧子步数
+float totalTime = 0.0f;  // 模拟运行时间
+float beginTime = 5.0f;  // 模拟开始时间
 
 // ======================== 函数声明 ========================
 
@@ -64,7 +68,7 @@ int main()
 #endif
 
     // ---- 一、初始化窗口和OpenGL上下文 ----
-    MyInit myInit(SCR_WIDTH, SCR_HEIGHT, "CG FinalWork Step2 — 粒子系统基础");
+    MyInit myInit(SCR_WIDTH, SCR_HEIGHT, "CG FinalWork");
 
     // 注册回调函数
     myInit.SetFramebufferSizeCallback(framebuffer_size_callback);
@@ -87,11 +91,11 @@ int main()
     // 水箱尺寸：宽1.0 × 高2.0 × 深1.0，中心在原点（y ∈ [-1, 1]）
     // 粒子块放置在水箱上半部分（y ∈ [0.0, 1.0]），XZ范围留出边距
     // 每个维度10个粒子，间距0.1，共10×10×10 = 1000个粒子
-    float spacing = 0.08f;
-    glm::vec3 blockMin(-0.45f, 0.05f, -0.45f);  // 粒子块最小角（水箱上半部分的底部）
-    glm::vec3 blockMax( 0.45f, 0.95f,  0.45f);  // 粒子块最大角（水箱上半部分的顶部）
-    //glm::vec3 blockMin(-0.3f, 0.3f, -0.3f);
-    //glm::vec3 blockMax( 0.3f, 0.9f,  0.3f);
+    float spacing = 0.1f;
+    //glm::vec3 blockMin(-0.45f, 0.05f, -0.45f);  // 粒子块最小角（水箱上半部分的底部）
+    //glm::vec3 blockMax( 0.45f, 0.95f,  0.45f);  // 粒子块最大角（水箱上半部分的顶部）
+    glm::vec3 blockMin(-0.3f, 0.3f, -0.3f);
+    glm::vec3 blockMax( 0.3f, 0.9f,  0.3f);
 
     fluidSystem.initializeParticles(blockMin, blockMax, spacing);
 
@@ -100,7 +104,7 @@ int main()
               << "Y[" << blockMin.y << ", " << blockMax.y << "]  "
               << "Z[" << blockMin.z << ", " << blockMax.z << "]" << std::endl;
     std::cout << "  粒子间距: " << spacing << std::endl;
-    std::cout << "  光滑核半径 h: " << fluidSystem.kernelRadius << std::endl;
+    std::cout << "  光滑核半径 h: " << fluidSystem.h << std::endl;
     std::cout << "  粒子渲染半径: " << fluidSystem.particleRadius << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "操作说明：" << std::endl;
@@ -159,13 +163,23 @@ int main()
         float currentFrame = static_cast<float>(glfwGetTime());
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
+        totalTime += deltaTime;
 
         // 处理键盘输入
         processKeyboard(myInit.window);
 
         // 更新流体模拟
-        deltaTime /= 3.0f;
-        fluidSystem.update(deltaTime);
+        //deltaTime /= 3.0f;
+        //fluidSystem.update(deltaTime);
+        if(totalTime > beginTime)
+        {
+            fluidSystem.update(fixedDt);
+        }
+        // for (int s = 0; s < subSteps; ++s)
+        // {
+        //     fluidSystem.update(fixedDt);
+        // }
+        
 
         // 更新粒子位置数据到VBO
         std::vector<float> newPosData = fluidSystem.getPositionData();
@@ -173,7 +187,7 @@ int main()
         glBufferSubData(GL_ARRAY_BUFFER, 0, newPosData.size() * sizeof(float), newPosData.data());
         glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-        // 
+        // 更新粒子颜色
         std::vector<glm::vec3> newColorData = fluidSystem.getColorData();
         glBindBuffer(GL_ARRAY_BUFFER, particleVBO_color);
         glBufferSubData(GL_ARRAY_BUFFER, 0, newColorData.size() * sizeof(glm::vec3), newColorData.data());
@@ -203,7 +217,7 @@ int main()
         particleShader.setMat4("view", view);
         particleShader.setMat4("projection", projection);
 
-        particleShader.setFloat("pointScale", 5.0f);
+        particleShader.setFloat("pointScale", 15.0f);
 
         // 设置粒子颜色（浅蓝色，模拟水滴外观） 暂时不需要
         particleShader.setVec3("particleColor", glm::vec3(0.2f, 0.5f, 0.9f));
