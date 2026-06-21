@@ -1,31 +1,39 @@
 #version 330 core
 
-/// @brief SSFR厚度通道片元着色器 —— 累积流体厚度
-/// 对于每个粒子，计算视线穿过该粒子球体的弦长（即厚度贡献），
-/// 所有粒子的贡献通过加法混合（GL_ONE, GL_ONE）累加到厚度纹理中。
-/// 厚度纹理在最终着色时用于计算光吸收（Beer-Lambert 定律）。
+/// @brief SSFR 厚度准备通道片元着色器
+/// 参考 PositionBasedFluids 中 fluidThicknessTexture.frag 的实现
+///
+/// 通过加法混合（GL_ONE, GL_ONE）累积视线方向上穿过流体的厚度。
+///
+/// 厚度贡献 = thicknessScaler × normalViewSpace.z
+/// 其中 normalViewSpace.z = sqrt(1 - x² - y²) 是球面法线在视线方向（-Z）的分量。
+/// 球心处 z=1（最大贡献），球边缘处 z=0（无贡献）。
 
-in vec3 vWorldPos;
-in vec3 vViewPos;
-in float vWorldRadius;
+in vec3 vCenterPosViewSpace;
+in float vDensity;
 
-layout (location = 0) out float fragThickness;  // 输出到 GL_R32F 颜色纹理
+out vec4 fThickness;
+
+uniform float uPointSize;          // 粒子世界空间渲染半径
+uniform float uThicknessScaler;    // 厚度缩放系数（参考值 0.05）
+uniform float uMinimumDensity;     // 密度阈值
+
+const vec2 POINT_CENTER = vec2(0.5, 0.5);
 
 void main()
 {
-    // ---- 第1步：圆形裁剪（与深度通道一致） ----
-    vec2 offset = gl_PointCoord - 0.5;
-    float dist = length(offset) * 2.0;
-
-    if (dist > 1.0)
+    if (vDensity < uMinimumDensity)
         discard;
 
-    // ---- 第2步：计算视线穿过球体的弦长 ----
-    // 对于距球心归一化距离为 dist 的点，球体在该点的"厚度"（视线方向穿越距离）
-    // thickness = 2 * R * sqrt(1 - dist²)
-    // dist=0（球心）时厚度 = 2R（直径），dist=1（球边缘）时厚度 = 0
-    float height = sqrt(max(0.0, 1.0 - dist * dist));
-    float thickness = 2.0 * vWorldRadius * height;
+    vec2 pointCoord = (gl_PointCoord - POINT_CENTER) * vec2(2.0, -2.0);
+    float xySqLen = dot(pointCoord, pointCoord);
 
-    fragThickness = thickness;
+    if (xySqLen > 1.0)
+        discard;
+
+    vec3 normalViewSpace = vec3(pointCoord, sqrt(1.0 - xySqLen));
+
+    // 厚度 = scaler × 视线方向分量
+    // 写入 R 通道（加法混合自动累积多粒子贡献）
+    fThickness = vec4(uThicknessScaler * normalViewSpace.z, 0.0, 0.0, 1.0);
 }

@@ -1,38 +1,38 @@
 #version 330 core
 
-/// @brief SSFR粒子顶点着色器 —— 将每个粒子渲染为覆盖其球体范围的大点精灵
-/// 用于深度通道（输出球面深度）和厚度通道（输出射线穿越球体的厚度）
-/// 点大小根据粒子世界空间半径和到摄像机的距离自动计算
+/// @brief SSFR 粒子顶点着色器 —— 所有粒子渲染通道共用
+/// 参考 PositionBasedFluids 中 fluid.vert 的实现
+///
+/// 将粒子渲染为相机空间点精灵，点大小根据粒子半径和深度自动缩放。
+/// POINT_SIZE_SCALER 是将世界空间半径映射到屏幕像素的经验系数，
+/// 参考实现中使用 2000（针对 ~1000px 高度的窗口）。本项目针对 600px 调整。
 
-layout (location = 0) in vec3 aPos;   // 粒子世界空间位置
+layout (location = 0) in vec3 aPos;          // 粒子世界空间位置
 
-uniform mat4 model;
-uniform mat4 view;
-uniform mat4 projection;
-uniform float pointScale;            // 点大小缩放系数（用于手动调节）
-uniform float particleWorldRadius;   // 粒子的世界空间渲染半径（应略大于物理半径以保证粒子间有重叠）
+uniform mat4 uView;          // 视图矩阵
+uniform mat4 uProjection;    // 投影矩阵
+uniform float uPointSize;    // 粒子世界空间渲染半径（= PARTICLE_RADIUS * scaler）
 
-out vec3 vWorldPos;       // 粒子中心的世界空间位置
-out vec3 vViewPos;        // 粒子中心的视图空间位置
-out float vWorldRadius;   // 世界空间渲染半径
+out vec3 vCenterPosViewSpace;  // 粒子球心在视图空间的坐标
+out float vDensity;            // 预留：密度值（用于密度过滤，当前未使用）
+
+// 将世界空间半径映射到屏幕空间点精灵像素数的缩放系数
+// 屏幕Y方向像素密度 ≈ screenHeight / (2 * tan(fovY/2))
+// 对于 600px 屏幕和 45° FOV: 600 / (2*0.414) ≈ 724 px/rad
+// 点直径需要的像素 = 2 * radius * pxPerRad / depth
+// 本系数取 2 * 724 ≈ 1448，保守取 2000（参考值，保证足够重叠）
+const float POINT_SIZE_SCALER = 2000.0;
 
 void main()
 {
-    vec4 worldPos = model * vec4(aPos, 1.0);
-    vec4 viewPos  = view * worldPos;
+    vec4 viewPos = uView * vec4(aPos, 1.0);
+    gl_Position = uProjection * viewPos;
 
-    gl_Position = projection * viewPos;
+    vCenterPosViewSpace = viewPos.xyz;
 
-    vWorldPos    = worldPos.xyz;
-    vViewPos     = viewPos.xyz;
-    vWorldRadius = particleWorldRadius;
+    // 根据深度缩放点大小：近大远小
+    // viewPos.z < 0（相机看向 -Z），取反得到正距离
+    gl_PointSize = POINT_SIZE_SCALER * uPointSize / (-vCenterPosViewSpace.z);
 
-    // 将世界空间半径投影到屏幕空间，计算所需的点精灵像素尺寸
-    // 原理：在距摄像机 d 处，世界尺寸 w 对应的屏幕像素数 ≈ (screenHeight/2) * w / (d * tan(fovY/2))
-    // 乘以 pointScale 允许手动调节以保证粒子之间有充分重叠
-    float viewDepth = -viewPos.z;  // viewPos.z < 0 在摄像机前方，取反得到正的距离
-    gl_PointSize = pointScale * vWorldRadius / max(viewDepth, 0.001);
-
-    // 限制最小/最大点大小，防止极端情况
-    gl_PointSize = clamp(gl_PointSize, 2.0, 200.0);
+    vDensity = 1.0;  // 当前不使用密度过滤，所有粒子都参与渲染
 }

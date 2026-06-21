@@ -1,12 +1,11 @@
-/// @brief 主程序 —— 基于PBF的3D流体模拟，使用屏幕空间流体渲染(SSFR)
-/// <summary>
-/// SSFR 渲染管线分为以下通道：
-///   通道1（深度通道）：将每个粒子渲染为球面深度到大球点精灵，输出视图空间线性深度
-///   通道2（厚度通道）：渲染相同粒子，加法混合累积视线穿过流体的总厚度
-///   通道3（双边滤波）：对深度纹理做2次双边滤波，填充粒子间隙同时保持边缘
-///   通道4（着色合成）：从平滑深度重建法线→Blinn-Phong光照→厚度吸收→与背景混合
-///   通道5（水箱线框）：在水箱深度之上渲染半透明线框
-/// </summary>
+/// @brief 主程序 —— 基于 PBF 的 3D 流体模拟，使用 SSFR 实现写实水面渲染
+///
+/// SSFR 渲染管线（参考 PositionBasedFluids 实现）：
+///   通道1（深度准备）：GL_POINTS 渲染粒子球面 → NDC 深度纹理 + 硬件深度缓冲
+///   通道2（双边平滑）：全屏四边形 × N轮迭代，分离式水平/垂直双边滤波
+///   通道3（法线计算）：全屏四边形，从平滑深度重建视图空间法线（边缘感知）
+///   通道4（厚度累积）：GL_POINTS 加法混合，累加视线方向流体厚度
+///   通道5（流体着色）：全屏四边形，折射 + 天空反射 + Beer-Lambert 吸收
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -30,20 +29,16 @@
 
 // ======================== 全局变量 ========================
 
-// 窗口尺寸（FBO 纹理大小与此一致）
 const unsigned int SCR_WIDTH  = 800;
 const unsigned int SCR_HEIGHT = 600;
 
-// 摄像机
 MyCamera camera(glm::vec3(0.0f, 1.0f, 5.0f), glm::vec3(0.0f, 1.0f, 0.0f), -90.0f, -12.0f);
 
-// 鼠标状态
 float  lastX             = SCR_WIDTH / 2.0f;
 float  lastY             = SCR_HEIGHT / 2.0f;
 bool   firstMouse        = true;
 bool   leftButtonPressed = false;
 
-// 时间
 float deltaTime = 0.0f;
 float lastFrame = 0.0f;
 float fixedDt   = 0.004f;
@@ -58,17 +53,14 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset);
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods);
 void processKeyboard(GLFWwindow* window);
 
-// ---- FBO 辅助函数 ----
+// ---- FBO / 纹理工具 ----
 
-/// <summary>
-/// 创建一个 R32F 浮点纹理，用于 FBO 的颜色附件（存储深度或厚度）
-/// </summary>
-GLuint createFloatTexture(int width, int height)
+GLuint createR32FTexture(int w, int h)
 {
     GLuint tex;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, width, height, 0, GL_RED, GL_FLOAT, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, w, h, 0, GL_RED, GL_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -76,49 +68,26 @@ GLuint createFloatTexture(int width, int height)
     return tex;
 }
 
-/// <summary>
-/// 创建深度渲染缓冲对象（RBO），用作 FBO 的深度附件
-/// </summary>
-GLuint createDepthRBO(int width, int height)
+GLuint createRGBA32FTexture(int w, int h)
+{
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    return tex;
+}
+
+GLuint createDepthRBO(int w, int h)
 {
     GLuint rbo;
     glGenRenderbuffers(1, &rbo);
     glBindRenderbuffer(GL_RENDERBUFFER, rbo);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, width, height);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
     return rbo;
-}
-
-/// <summary>
-/// 构建水箱（透明包围盒）的线框顶点数据
-/// 12条棱 × 每条棱2个顶点 = 24个顶点，使用 GL_LINES 绘制
-/// </summary>
-std::vector<float> buildTankVertices(const glm::vec3& minBound, const glm::vec3& maxBound)
-{
-    float x0 = minBound.x, x1 = maxBound.x;
-    float y0 = minBound.y, y1 = maxBound.y;
-    float z0 = minBound.z, z1 = maxBound.z;
-
-    // 12条棱的顶点对（每条棱2个顶点）
-    std::vector<float> edges = {
-        // 底面4条棱（y = y0）
-        x0, y0, z0,  x1, y0, z0,
-        x1, y0, z0,  x1, y0, z1,
-        x1, y0, z1,  x0, y0, z1,
-        x0, y0, z1,  x0, y0, z0,
-
-        // 顶面4条棱（y = y1）
-        x0, y1, z0,  x1, y1, z0,
-        x1, y1, z0,  x1, y1, z1,
-        x1, y1, z1,  x0, y1, z1,
-        x0, y1, z1,  x0, y1, z0,
-
-        // 4条立柱
-        x0, y0, z0,  x0, y1, z0,
-        x1, y0, z0,  x1, y1, z0,
-        x1, y0, z1,  x1, y1, z1,
-        x0, y0, z1,  x0, y1, z1,
-    };
-    return edges;
 }
 
 // ======================== 主函数 ========================
@@ -130,7 +99,7 @@ int main()
 #endif
 
     // ---- 一、初始化窗口 ----
-    MyInit myInit(SCR_WIDTH, SCR_HEIGHT, "CG FinalWork — SSFR 流体渲染");
+    MyInit myInit(SCR_WIDTH, SCR_HEIGHT, "CG FinalWork — SSFR");
 
     myInit.SetFramebufferSizeCallback(framebuffer_size_callback);
     myInit.SetCursorPosCallback(mouse_callback);
@@ -140,78 +109,85 @@ int main()
 
     std::cout << "OpenGL Version:  " << glGetString(GL_VERSION) << std::endl;
     std::cout << "GLSL Version:    " << glGetString(GL_SHADING_LANGUAGE_VERSION) << std::endl;
-    std::cout << "Renderer:        " << glGetString(GL_RENDERER) << std::endl;
     std::cout << "========================================" << std::endl;
 
-    // ---- 二、初始化流体粒子系统 ----
+    // ---- 二、初始化流体 ----
     FluidSystem fluidSystem;
 
     float spacing = 0.1f;
-    glm::vec3 blockMin(-0.3f, 0.3f, -0.3f);
-    glm::vec3 blockMax( 0.3f, 0.9f,  0.3f);
+    glm::vec3 blockMin(-0.3f, 0.05f, -0.3f);
+    glm::vec3 blockMax( 0.3f, 0.95f,  0.3f);
+    //glm::vec3 blockMin(-0.45f, 0.05f, -0.45f);
+    //glm::vec3 blockMax( 0.45f, 0.95f,  0.45f);
     fluidSystem.initializeParticles(blockMin, blockMax, spacing);
 
     int particleCount = static_cast<int>(fluidSystem.getParticleCount());
     std::cout << "粒子总数: " << particleCount << std::endl;
+    std::cout << "========================================" << std::endl;
 
     // ---- 三、加载着色器 ----
 
-    // 深度通道着色器（粒子球面 → 视图空间线性深度）
+    // 粒子着色器（深度准备 + 厚度准备共用顶点着色器）
     MyShader depthShader("src/ssfr_particle.vert", "src/ssfr_depth.frag");
-
-    // 厚度通道着色器（粒子球体弦长 → 加法累积）
     MyShader thicknessShader("src/ssfr_particle.vert", "src/ssfr_thickness.frag");
 
-    // 双边滤波着色器（全屏四边形 → 平滑深度纹理）
-    MyShader bilateralShader("src/ssfr_quad.vert", "src/ssfr_bilateral.frag");
+    // 后处理着色器（共用全屏四边形顶点着色器）
+    MyShader smoothShader( "src/ssfr_quad.vert", "src/ssfr_smooth.frag");
+    MyShader normalShader( "src/ssfr_quad.vert", "src/ssfr_normal.frag");
+    MyShader shadeShader(  "src/ssfr_quad.vert", "src/ssfr_shade.frag");
 
-    // 最终着色合成着色器（全屏四边形 → 法线重建 + 光照 + 厚度吸收）
-    MyShader shadeShader("src/ssfr_quad.vert", "src/ssfr_shade.frag");
+    // ---- 四、创建纹理和 FBO ----
 
-    // 水箱线框着色器
-    MyShader tankShader("src/tank.vert", "src/tank.frag");
-
-    // ---- 四、创建 FBO 和纹理 ----
-
-    // 深度通道 FBO（颜色附件: R32F 深度, 深度附件: RBO）
-    GLuint depthTex = createFloatTexture(SCR_WIDTH, SCR_HEIGHT);
-    GLuint depthRBO = createDepthRBO(SCR_WIDTH, SCR_HEIGHT);
+    // 深度通道
+    GLuint depthTex      = createR32FTexture(SCR_WIDTH, SCR_HEIGHT);
+    GLuint depthRBO      = createDepthRBO(SCR_WIDTH, SCR_HEIGHT);
     GLuint depthFBO;
     glGenFramebuffers(1, &depthFBO);
     glBindFramebuffer(GL_FRAMEBUFFER, depthFBO);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, depthTex, 0);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthRBO);
 
-    // 厚度通道 FBO（颜色附件: R32F 厚度, 无深度测试所以不需要深度附件）
-    GLuint thicknessTex = createFloatTexture(SCR_WIDTH, SCR_HEIGHT);
+    // 厚度通道（独立深度 RBO，因为在通道4中需要深度测试 + 禁止深度写入）
+    GLuint thicknessTex  = createR32FTexture(SCR_WIDTH, SCR_HEIGHT);
+    GLuint thicknessRBO  = createDepthRBO(SCR_WIDTH, SCR_HEIGHT);
     GLuint thicknessFBO;
     glGenFramebuffers(1, &thicknessFBO);
     glBindFramebuffer(GL_FRAMEBUFFER, thicknessFBO);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, thicknessTex, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, thicknessRBO);
 
-    // 双边滤波 ping-pong FBO（不需要深度附件，全屏四边形绘制）
-    GLuint smoothTex1 = createFloatTexture(SCR_WIDTH, SCR_HEIGHT);
-    GLuint smoothFBO1;
-    glGenFramebuffers(1, &smoothFBO1);
-    glBindFramebuffer(GL_FRAMEBUFFER, smoothFBO1);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, smoothTex1, 0);
+    // 双边平滑 ping-pong（只需要颜色附件，全屏四边形不需要深度）
+    GLuint smoothTexA = createR32FTexture(SCR_WIDTH, SCR_HEIGHT);
+    GLuint smoothFBO_A;
+    glGenFramebuffers(1, &smoothFBO_A);
+    glBindFramebuffer(GL_FRAMEBUFFER, smoothFBO_A);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, smoothTexA, 0);
 
-    GLuint smoothTex2 = createFloatTexture(SCR_WIDTH, SCR_HEIGHT);
-    GLuint smoothFBO2;
-    glGenFramebuffers(1, &smoothFBO2);
-    glBindFramebuffer(GL_FRAMEBUFFER, smoothFBO2);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, smoothTex2, 0);
+    GLuint smoothTexB = createR32FTexture(SCR_WIDTH, SCR_HEIGHT);
+    GLuint smoothFBO_B;
+    glGenFramebuffers(1, &smoothFBO_B);
+    glBindFramebuffer(GL_FRAMEBUFFER, smoothFBO_B);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, smoothTexB, 0);
 
-    // 验证所有 FBO 的完整性
+    // 法线通道
+    GLuint normalTex = createRGBA32FTexture(SCR_WIDTH, SCR_HEIGHT);
+    GLuint normalFBO;
+    glGenFramebuffers(1, &normalFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, normalFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, normalTex, 0);
+
+    // 验证 FBO 完整性
+    GLenum fboStatus;
     glBindFramebuffer(GL_FRAMEBUFFER, depthFBO);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-        std::cout << "ERROR: Depth FBO 不完整！" << std::endl;
+    fboStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (fboStatus != GL_FRAMEBUFFER_COMPLETE)
+        std::cout << "ERROR: depthFBO 不完整! 0x" << std::hex << fboStatus << std::endl;
 
     glBindFramebuffer(GL_FRAMEBUFFER, thicknessFBO);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-        std::cout << "ERROR: Thickness FBO 不完整！" << std::endl;
+    fboStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (fboStatus != GL_FRAMEBUFFER_COMPLETE)
+        std::cout << "ERROR: thicknessFBO 不完整! 0x" << std::hex << fboStatus << std::endl;
 
-    // 恢复默认帧缓冲
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     // ---- 五、创建粒子 VAO/VBO ----
@@ -220,7 +196,6 @@ int main()
     unsigned int particleVAO, particleVBO;
     glGenVertexArrays(1, &particleVAO);
     glGenBuffers(1, &particleVBO);
-
     glBindVertexArray(particleVAO);
     glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
     glBufferData(GL_ARRAY_BUFFER, positionData.size() * sizeof(float), positionData.data(), GL_DYNAMIC_DRAW);
@@ -228,83 +203,55 @@ int main()
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
 
-    // ---- 六、创建水箱线框 VAO/VBO ----
-    std::vector<float> tankVertices = buildTankVertices(fluidSystem.tankMin, fluidSystem.tankMax);
-
-    unsigned int tankVAO, tankVBO;
-    glGenVertexArrays(1, &tankVAO);
-    glGenBuffers(1, &tankVBO);
-
-    glBindVertexArray(tankVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, tankVBO);
-    glBufferData(GL_ARRAY_BUFFER, tankVertices.size() * sizeof(float), tankVertices.data(), GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glBindVertexArray(0);
-
-    // ---- 七、创建全屏四边形 VAO（空 VAO，顶点数据由 gl_VertexID 生成） ----
+    // ---- 六、创建全屏四边形 VAO（空 VAO，顶点由 gl_VertexID 生成） ----
     unsigned int quadVAO;
     glGenVertexArrays(1, &quadVAO);
 
-    // 启用点精灵程序尺寸控制
+    // 启用点精灵可编程大小
     glEnable(GL_PROGRAM_POINT_SIZE);
 
     std::cout << "========================================" << std::endl;
-    std::cout << "操作说明：" << std::endl;
-    std::cout << "  WASD      — 移动摄像机" << std::endl;
-    std::cout << "  鼠标左键   — 旋转视角" << std::endl;
-    std::cout << "  滚轮      — 缩放" << std::endl;
-    std::cout << "  ESC       — 退出" << std::endl;
+    std::cout << "SSFR 渲染管线就绪" << std::endl;
     std::cout << "========================================" << std::endl;
 
-    // ---- 八、渲染循环 ----
+    // ---- 七、渲染循环 ----
     while (!glfwWindowShouldClose(myInit.window))
     {
-        // 计算帧时间
+        // 帧时间
         float currentFrame = static_cast<float>(glfwGetTime());
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
-        totalTime += deltaTime;
 
-        // 处理键盘
         processKeyboard(myInit.window);
 
-        // ---- 更新物理模拟 ----
+        // ---- 物理模拟 ----
+        totalTime += deltaTime;
         if (totalTime > beginTime)
-        {
             fluidSystem.update(fixedDt);
-        }
 
-        // ---- 更新粒子位置 VBO ----
+        // ---- 上传粒子位置 ----
         std::vector<float> newPosData = fluidSystem.getPositionData();
         glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
         glBufferSubData(GL_ARRAY_BUFFER, 0, newPosData.size() * sizeof(float), newPosData.data());
         glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-        // ---- 准备通用矩阵 ----
-        glm::mat4 model = glm::mat4(1.0f);
-        glm::mat4 projection = glm::perspective(
-            glm::radians(camera.Zoom),
-            (float)SCR_WIDTH / (float)SCR_HEIGHT,
-            0.1f, 100.0f);
-        glm::mat4 view = camera.GetViewMatrix();
+        // ---- 矩阵 ----
+        glm::mat4 projection = glm::perspective(glm::radians(camera.Zoom),
+                                                (float)SCR_WIDTH / (float)SCR_HEIGHT,
+                                                0.1f, 100.0f);
+        glm::mat4 view       = camera.GetViewMatrix();
 
-        // 粒子渲染半径（取光滑核半径的90%，确保球面间有充分重叠投影）
-        float particleRenderRadius = fluidSystem.h * 0.9f;
+        // 粒子渲染半径（世界空间）= PARTICLE_RADIUS * particleRadiusScaler
+        // 参考实现中 particleRadiusScaler = 2.0，即渲染半径 = 物理半径 × 2
+        float uPointSize = fluidSystem.h * 0.4f;   // 用光滑核半径作为渲染半径
 
-        // 点精灵投影缩放系数
-        // gl_PointSize = pointScale * worldRadius / viewDepth
-        // worldRadius 在 viewDepth 处的屏幕投影角度为 worldRadius/viewDepth 弧度
-        // 屏幕Y方向像素密度 = screenHeight / (2*tan(fovY/2)) 像素/弧度
-        // 点精灵直径 = 2 * worldRadius/viewDepth * screenHeight / (2*tan(fovY/2))
-        //            = worldRadius/viewDepth * screenHeight / tan(fovY/2)
-        float pointScale = SCR_HEIGHT / tan(glm::radians(camera.Zoom * 0.5f));
+        // 密度阈值：没有密度数据时设为 0，不做过滤
+        float uMinimumDensity = 0.0f;
 
-        // ============================================================
-        // 通道1：深度渲染
-        //   将粒子作为球面渲染到 depthFBO，输出视图空间线性深度
-        //   同时写入硬件深度缓冲用于正确的粒子间遮挡
-        // ============================================================
+        // ================================================================
+        // 通道1：深度准备
+        //   渲染粒子球面 → 输出 NDC 深度到 depthTex，同时写入硬件深度缓冲
+        // ================================================================
         glBindFramebuffer(GL_FRAMEBUFFER, depthFBO);
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -313,194 +260,204 @@ int main()
         glDisable(GL_BLEND);
 
         depthShader.use();
-        depthShader.setMat4("model", model);
-        depthShader.setMat4("view", view);
-        depthShader.setMat4("projection", projection);
-        depthShader.setFloat("particleWorldRadius", particleRenderRadius);
-        depthShader.setFloat("pointScale", pointScale);
-        depthShader.setFloat("nearPlane", 0.1f);
-        depthShader.setFloat("farPlane", 100.0f);
+        depthShader.setMat4("uView", view);
+        depthShader.setMat4("uProjection", projection);
+        depthShader.setFloat("uPointSize", uPointSize);
+        depthShader.setFloat("uMinimumDensity", uMinimumDensity);
 
         glBindVertexArray(particleVAO);
         glDrawArrays(GL_POINTS, 0, particleCount);
 
-        // ============================================================
-        // 通道2：厚度渲染
-        //   加法混合累积每个像素处视线穿过流体的总厚度
-        //   禁用深度测试——沿同一条视线的所有粒子都应累加厚度
-        // ============================================================
-        glBindFramebuffer(GL_FRAMEBUFFER, thicknessFBO);
+        // ================================================================
+        // 通道2：双边滤波平滑深度
+        //   分离式 1D 双边滤波（水平 + 垂直为一轮），共 6 轮，核半径递减
+        //   核半径: 8 → 6 → 5 → 4 → 3 → 2（粗→细平滑）
+        // ================================================================
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_BLEND);
+
+        smoothShader.use();
+        smoothShader.setInt("uSeparate", 1);  // 分离式 (1D 水平/垂直)
+
+        // 写死作为循环展开（GLSL 不支持动态数组作为 uniform）：
+        // 每一轮 = 水平 pass + 垂直 pass，数据在 smoothTexA/B 之间乒乓
+        const int smoothRounds = 6;
+        const int kernels[smoothRounds] = {8, 6, 5, 4, 3, 2};
+
+        // 源 = depthTex (raw), 目标 = smoothTexA
+        GLuint srcTex = depthTex;
+        GLuint dstFBO = smoothFBO_A;
+        GLuint dstTex = smoothTexA;
+        smoothShader.setInt("uSeparate", 1);
+
+        for (int r = 0; r < smoothRounds; r++)
+        {
+            int kr = kernels[r];
+
+            // --- 水平 pass ---
+            glBindFramebuffer(GL_FRAMEBUFFER, dstFBO);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            smoothShader.setInt("uKernelRadius", kr);
+            smoothShader.setBool("uHorizontal", true);
+            smoothShader.setVec2("texelSize", 1.0f / SCR_WIDTH, 1.0f / SCR_HEIGHT);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, srcTex);
+            smoothShader.setInt("depthTex", 0);
+
+            glBindVertexArray(quadVAO);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            // --- 垂直 pass ---
+            // 乒乓切换：水平结果在 dstTex，垂直要写回 src 的另一侧
+            GLuint midTex  = dstTex;   // 水平输出
+            GLuint midFBO  = dstFBO;   // 水平 FBO
+            GLuint outTex  = (r < smoothRounds - 1) ? ((dstTex == smoothTexA) ? smoothTexB : smoothTexA) : smoothTexB;
+            GLuint outFBO  = (r < smoothRounds - 1) ? ((dstFBO == smoothFBO_A) ? smoothFBO_B : smoothFBO_A) : smoothFBO_B;
+
+            glBindFramebuffer(GL_FRAMEBUFFER, outFBO);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            smoothShader.setInt("uKernelRadius", kr);
+            smoothShader.setBool("uHorizontal", false);
+            glBindTexture(GL_TEXTURE_2D, midTex);
+            smoothShader.setInt("depthTex", 0);
+
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            // 下一轮的源 = 本轮垂直的输出
+            srcTex = outTex;
+            dstFBO = midFBO;  // 水平 FBO
+            dstTex = midTex;  // 水平纹理
+        }
+
+        // 最终平滑结果在 smoothTexB
+        GLuint finalSmoothedTex = smoothTexB;
+        // (此时 srcTex == smoothTexB, 因为最后一轮垂直写入了 outTex == smoothTexB)
+
+        // ================================================================
+        // 通道3：法线计算
+        //   从平滑深度重建视图空间位置 → 边缘感知切线选择 → 叉积求法线
+        // ================================================================
+        glBindFramebuffer(GL_FRAMEBUFFER, normalFBO);
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT);
-        glDisable(GL_DEPTH_TEST);
+
+        normalShader.use();
+        normalShader.setMat4("projInverse", glm::inverse(projection));
+        normalShader.setVec2("uScreenSize", glm::vec2(SCR_WIDTH, SCR_HEIGHT));  // ivec2 as vec2 for compatibility (will be cast in shader)
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, finalSmoothedTex);
+        normalShader.setInt("depthTex", 0);
+
+        glBindVertexArray(quadVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        // ================================================================
+        // 通道4：厚度累积
+        //   加法混合（GL_ONE, GL_ONE）累加所有粒子贡献
+        //   深度测试开启（用深度通道的深度做遮挡），禁止深度写入
+        //   需要将深度通道的深度缓冲复制到厚度 FBO
+        // ================================================================
+        // 先将深度从 depthFBO 拷贝到 thicknessFBO
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, depthFBO);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, thicknessFBO);
+        glBlitFramebuffer(0, 0, SCR_WIDTH, SCR_HEIGHT,
+                          0, 0, SCR_WIDTH, SCR_HEIGHT,
+                          GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, thicknessFBO);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);  // 只清颜色，保留深度
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);        // 禁止写入深度
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE);  // 加法混合
 
         thicknessShader.use();
-        thicknessShader.setMat4("model", model);
-        thicknessShader.setMat4("view", view);
-        thicknessShader.setMat4("projection", projection);
-        thicknessShader.setFloat("particleWorldRadius", particleRenderRadius);
-        thicknessShader.setFloat("pointScale", pointScale);
+        thicknessShader.setMat4("uView", view);
+        thicknessShader.setMat4("uProjection", projection);
+        thicknessShader.setFloat("uPointSize", uPointSize);
+        thicknessShader.setFloat("uThicknessScaler", 0.05f);  // 参考值
+        thicknessShader.setFloat("uMinimumDensity", uMinimumDensity);
 
+        glBindVertexArray(particleVAO);
         glDrawArrays(GL_POINTS, 0, particleCount);
 
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glDisable(GL_BLEND);
+        glDepthMask(GL_TRUE);
 
-        // ============================================================
-        // 通道3：双边滤波（4次迭代，粗→精渐进式平滑）
-        //   迭代1 (粗):  大空间σ=4.0, 大深度σ=0.06  — 填充大间隙
-        //   迭代2 (中粗): 中空间σ=2.5, 中深度σ=0.04  — 消除中等起伏
-        //   迭代3 (中精): 小空间σ=1.5, 小深度σ=0.025 — 精细平滑
-        //   迭代4 (精):  最小空间σ=1.0, 最小深度σ=0.015 — 最终抛光
-        //   全部使用7×7核，在smoothTex1/smoothTex2之间乒乓切换
-        // ============================================================
-        int   filterRadius = 3;  // 7×7 核
-        float texelW = 1.0f / SCR_WIDTH;
-        float texelH = 1.0f / SCR_HEIGHT;
-
-        bilateralShader.use();
-        bilateralShader.setInt("kernelRadius", filterRadius);
-        bilateralShader.setVec2("texelSize", texelW, texelH);
-
-        glBindVertexArray(quadVAO);
-
-        // --- 迭代1：原始深度 → smoothTex1（粗平滑，填大间隙）---
-        glBindFramebuffer(GL_FRAMEBUFFER, smoothFBO1);
-        glClear(GL_COLOR_BUFFER_BIT);
-        bilateralShader.setFloat("sigmaSpatial", 4.0f);
-        bilateralShader.setFloat("sigmaRange",   0.06f);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, depthTex);
-        bilateralShader.setInt("depthTex", 0);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-
-        // --- 迭代2：smoothTex1 → smoothTex2（中粗平滑）---
-        glBindFramebuffer(GL_FRAMEBUFFER, smoothFBO2);
-        glClear(GL_COLOR_BUFFER_BIT);
-        bilateralShader.setFloat("sigmaSpatial", 2.5f);
-        bilateralShader.setFloat("sigmaRange",   0.04f);
-        glBindTexture(GL_TEXTURE_2D, smoothTex1);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-
-        // --- 迭代3：smoothTex2 → smoothTex1（中精细平滑）---
-        glBindFramebuffer(GL_FRAMEBUFFER, smoothFBO1);
-        glClear(GL_COLOR_BUFFER_BIT);
-        bilateralShader.setFloat("sigmaSpatial", 1.5f);
-        bilateralShader.setFloat("sigmaRange",   0.025f);
-        glBindTexture(GL_TEXTURE_2D, smoothTex2);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-
-        // --- 迭代4：smoothTex1 → smoothTex2（精平滑，最终抛光）---
-        glBindFramebuffer(GL_FRAMEBUFFER, smoothFBO2);
-        glClear(GL_COLOR_BUFFER_BIT);
-        bilateralShader.setFloat("sigmaSpatial", 1.0f);
-        bilateralShader.setFloat("sigmaRange",   0.015f);
-        glBindTexture(GL_TEXTURE_2D, smoothTex1);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-
-        // ============================================================
-        // 通道4：最终着色与合成
-        //   从平滑深度重建世界位置 → dFdx/dFdy 计算法线 →
-        //   Blinn-Phong 光照 → 厚度吸收（Beer-Lambert）→ 与背景混合
-        // ============================================================
+        // ================================================================
+        // 通道5：流体着色
+        //   全屏四边形：折射（背景） + 天空反射 + Beer-Lambert 吸收
+        // ================================================================
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glClearColor(0.15f, 0.15f, 0.18f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glDisable(GL_DEPTH_TEST);
 
         shadeShader.use();
-        shadeShader.setMat4("invProj", glm::inverse(projection));
-        shadeShader.setMat4("invView", glm::inverse(view));
-        shadeShader.setVec3("viewPos", camera.Position);
-        shadeShader.setVec3("lightDir", glm::normalize(glm::vec3(1.0f, 2.0f, 1.0f)));
-
-        // 天空/环境颜色（用于Fresnel反射）
-        shadeShader.setVec3("skyZenithColor",  glm::vec3(0.22f, 0.52f, 0.82f));  // 天顶深蓝
-        shadeShader.setVec3("skyHorizonColor", glm::vec3(0.60f, 0.78f, 0.92f));  // 地平线浅蓝
-        shadeShader.setVec3("sunColor",        glm::vec3(1.0f,  0.93f, 0.78f));  // 暖色太阳光
-
-        // 水光学参数
-        shadeShader.setFloat("absorptionCoeff", 2.0f);   // 吸收系数（与逐通道系数配合）
-        shadeShader.setVec3("backgroundColor", glm::vec3(0.15f, 0.15f, 0.18f));
+        shadeShader.setMat4("uViewInverse", glm::inverse(view));
+        shadeShader.setMat4("uViewTranspose", glm::transpose(view));
+        shadeShader.setMat4("uProjInverse", glm::inverse(projection));
+        shadeShader.setVec2("uScreenSize", glm::vec2(SCR_WIDTH, SCR_HEIGHT));
+        shadeShader.setVec3("uFluidColor", glm::vec3(0.15f, 0.45f, 0.75f));
+        shadeShader.setVec3("uCameraPosition", camera.Position);
+        shadeShader.setVec3("uSkyZenithColor", glm::vec3(0.22f, 0.52f, 0.82f));
+        shadeShader.setVec3("uSkyHorizonColor", glm::vec3(0.60f, 0.78f, 0.92f));
+        shadeShader.setVec3("uBackgroundColor", glm::vec3(0.15f, 0.15f, 0.18f));
 
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, smoothTex2);
-        shadeShader.setInt("depthTex", 0);
+        glBindTexture(GL_TEXTURE_2D, normalTex);
+        shadeShader.setInt("uNormalViewSpaceTexture", 0);
 
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, thicknessTex);
-        shadeShader.setInt("thicknessTex", 1);
+        shadeShader.setInt("uThicknessTexture", 1);
+
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, finalSmoothedTex);
+        shadeShader.setInt("uSmoothedDepthTexture", 2);
 
         glBindVertexArray(quadVAO);
         glDrawArrays(GL_TRIANGLES, 0, 3);
 
-        // ============================================================
-        // 通道5：水箱线框
-        //   将深度缓冲从depthFBO拷贝到默认帧缓冲，使线框能被流体正确遮挡
-        //   然后用半透明白色绘制水箱的12条棱
-        // ============================================================
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, depthFBO);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-        glBlitFramebuffer(0, 0, SCR_WIDTH, SCR_HEIGHT,
-                          0, 0, SCR_WIDTH, SCR_HEIGHT,
-                          GL_DEPTH_BUFFER_BIT, GL_NEAREST);
-
-        glEnable(GL_DEPTH_TEST);
-        glDepthMask(GL_TRUE);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-        tankShader.use();
-        tankShader.setMat4("model", glm::mat4(1.0f));
-        tankShader.setMat4("view", view);
-        tankShader.setMat4("projection", projection);
-        tankShader.setVec3("lineColor", glm::vec3(0.7f, 0.85f, 1.0f));
-        tankShader.setFloat("alpha", 0.35f);
-
-        glBindVertexArray(tankVAO);
-        glLineWidth(1.5f);
-        glDrawArrays(GL_LINES, 0, 24);
-        glLineWidth(1.0f);
-
-        glDisable(GL_BLEND);
-
-        // ---- 显示帧率到标题栏 ----
+        // ---- FPS 显示 ----
         float fps = 1.0f / (deltaTime + 0.0001f);
         char title[128];
-        snprintf(title, sizeof(title), "CG FinalWork — SSFR | FPS: %.0f | 粒子数: %d",
-                 fps, particleCount);
+        snprintf(title, sizeof(title), "CG FinalWork | FPS: %.0f | Particles: %d", fps, particleCount);
         glfwSetWindowTitle(myInit.window, title);
 
-        // 交换缓冲
         glfwSwapBuffers(myInit.window);
         glfwPollEvents();
     }
 
-    // ---- 九、清理资源 ----
+    // ---- 清理 ----
     glDeleteVertexArrays(1, &particleVAO);
     glDeleteBuffers(1, &particleVBO);
-    glDeleteVertexArrays(1, &tankVAO);
-    glDeleteBuffers(1, &tankVBO);
     glDeleteVertexArrays(1, &quadVAO);
 
     glDeleteTextures(1, &depthTex);
     glDeleteTextures(1, &thicknessTex);
-    glDeleteTextures(1, &smoothTex1);
-    glDeleteTextures(1, &smoothTex2);
+    glDeleteTextures(1, &smoothTexA);
+    glDeleteTextures(1, &smoothTexB);
+    glDeleteTextures(1, &normalTex);
 
     glDeleteRenderbuffers(1, &depthRBO);
+    glDeleteRenderbuffers(1, &thicknessRBO);
 
     glDeleteFramebuffers(1, &depthFBO);
     glDeleteFramebuffers(1, &thicknessFBO);
-    glDeleteFramebuffers(1, &smoothFBO1);
-    glDeleteFramebuffers(1, &smoothFBO2);
+    glDeleteFramebuffers(1, &smoothFBO_A);
+    glDeleteFramebuffers(1, &smoothFBO_B);
+    glDeleteFramebuffers(1, &normalFBO);
 
     return 0;
 }
 
-// ======================== 回调函数实现 ========================
+// ======================== 回调函数 ========================
 
 void framebuffer_size_callback(GLFWwindow* /*window*/, int width, int height)
 {
@@ -525,9 +482,7 @@ void mouse_callback(GLFWwindow* /*window*/, double xposIn, double yposIn)
     lastY = ypos;
 
     if (leftButtonPressed)
-    {
         camera.ProcessMouseMovement(xoffset, yoffset);
-    }
 }
 
 void scroll_callback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset)
@@ -538,9 +493,7 @@ void scroll_callback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset)
 void mouse_button_callback(GLFWwindow* /*window*/, int button, int action, int /*mods*/)
 {
     if (button == GLFW_MOUSE_BUTTON_LEFT)
-    {
         leftButtonPressed = (action == GLFW_PRESS);
-    }
 }
 
 void processKeyboard(GLFWwindow* window)
